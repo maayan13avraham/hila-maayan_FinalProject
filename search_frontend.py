@@ -7,6 +7,7 @@ import re
 import math
 import pickle
 import time
+import heapq
 from collections import Counter, defaultdict
 from google.cloud import storage
 from inverted_index_gcp import InvertedIndex
@@ -23,6 +24,11 @@ ANCHOR_INDEX_NAME = "index_anchor"
 
 # Wikipedia size proxy for IDF stability (ok for minimal engine)
 N_CORPUS = 6_300_000
+
+# ---------------- Performance guards ----------------
+MAX_CANDIDATES = 100_000          # cap on number of docs we score per query
+MAX_POSTINGS_PER_TERM = 50_000    # safety cap per term while building candidates
+MAX_RESULTS = 100                # results returned
 
 ###############################################################################
 # Flask app
@@ -120,16 +126,47 @@ def read_posting_list(index_obj: InvertedIndex, term: str):
     return index_obj.read_a_posting_list(INDEX_DIR, term, bucket_name=BUCKET_NAME)
 
 ###############################################################################
-# Minimal scoring
+# Candidate generation (rare terms first) — key speed improvement
 ###############################################################################
-def tfidf_body_scores(query_tokens):
+def build_candidates(query_tokens, max_candidates=MAX_CANDIDATES):
     """
-    Simple TF-IDF dot product:
+    Build a capped set of candidate doc_ids using BODY index only,
+    starting from rare terms (small df first) to avoid huge unions.
+    """
+    if body_index is None or not query_tokens:
+        return set()
+
+    # collect (df, term) for terms existing in body index
+    terms = []
+    for t in set(query_tokens):
+        df = body_index.df.get(t)
+        if df:
+            terms.append((df, t))
+    terms.sort()  # rare first
+
+    cand = set()
+    for _df, term in terms:
+        pl = read_posting_list(body_index, term)
+        # safety cap per term
+        for doc_id, _tf in pl[:MAX_POSTINGS_PER_TERM]:
+            cand.add(doc_id)
+            if len(cand) >= max_candidates:
+                return cand
+    return cand
+
+###############################################################################
+# Minimal scoring (restricted to candidates)
+###############################################################################
+def tfidf_body_scores(query_tokens, candidates=None):
+    """
+    Simple TF-IDF dot product restricted to candidates:
       score(doc) += (1+log10(tf_q))*idf * (1+log10(tf_d))*idf
     """
     scores = defaultdict(float)
     if body_index is None or not query_tokens:
         return scores
+
+    cand_set = set(candidates) if candidates is not None else None
 
     q_tf = Counter(query_tokens)
     for term, qcnt in q_tf.items():
@@ -142,24 +179,31 @@ def tfidf_body_scores(query_tokens):
 
         pl = read_posting_list(body_index, term)
         for doc_id, tf in pl:
+            if cand_set is not None and doc_id not in cand_set:
+                continue
             wd = (1.0 + math.log10(tf)) * idf
             scores[doc_id] += wq * wd
 
     return scores
 
-def binary_match_count(index_obj: InvertedIndex, query_tokens):
+def binary_match_count(index_obj: InvertedIndex, query_tokens, candidates=None):
     """
-    Counts how many DISTINCT query tokens appear in doc (title/anchor).
+    Counts how many DISTINCT query tokens appear in doc (title/anchor),
+    restricted to candidates if provided.
     """
     scores = defaultdict(int)
     if index_obj is None or not query_tokens:
         return scores
+
+    cand_set = set(candidates) if candidates is not None else None
 
     for term in set(query_tokens):
         if term not in index_obj.df:
             continue
         pl = read_posting_list(index_obj, term)
         for doc_id, _ in pl:
+            if cand_set is not None and doc_id not in cand_set:
+                continue
             scores[doc_id] += 1
     return scores
 
@@ -219,19 +263,30 @@ def search():
     # minimal weights
     w_body, w_title, w_anchor = 1.0, 2.0, 1.5
 
+    # -------- Build capped candidates first (rare terms first) --------
     t0 = time.time()
-    body_scores = tfidf_body_scores(tokens)
+    candidates = build_candidates(tokens, MAX_CANDIDATES)
+    t_cand = time.time() - t0
+
+    # If no candidates from body (e.g., all OOV), fall back to empty
+    if not candidates:
+        total = time.time() - t_start
+        res = [("__time__", fmt_time(total))]
+        return jsonify(res)
+
+    t0 = time.time()
+    body_scores = tfidf_body_scores(tokens, candidates=candidates)
     t_body = time.time() - t0
 
     t0 = time.time()
-    title_scores = binary_match_count(title_index, tokens)
+    title_scores = binary_match_count(title_index, tokens, candidates=candidates)
     t_title = time.time() - t0
 
     t0 = time.time()
-    anchor_scores = binary_match_count(anchor_index, tokens)
+    anchor_scores = binary_match_count(anchor_index, tokens, candidates=candidates)
     t_anchor = time.time() - t0
 
-    candidates = set(body_scores) | set(title_scores) | set(anchor_scores)
+    # compute final score only on candidates
     ranked = []
     for doc_id in candidates:
         s = (w_body * body_scores.get(doc_id, 0.0) +
@@ -240,19 +295,19 @@ def search():
         if s > 0:
             ranked.append((doc_id, s))
 
-    ranked.sort(key=lambda x: x[1], reverse=True)
+    # Top-K without sorting everything
+    top = heapq.nlargest(MAX_RESULTS, ranked, key=lambda x: x[1])
 
     total = time.time() - t_start
 
-    # print to server logs (like before)
     print(
         f"[SEARCH TIMING] query='{query}' | total={total:.3f}s | "
-        f"body={t_body:.3f}s | title={t_title:.3f}s | anchor={t_anchor:.3f}s"
+        f"cand={t_cand:.3f}s | body={t_body:.3f}s | title={t_title:.3f}s | anchor={t_anchor:.3f}s | "
+        f"cands={len(candidates)}"
     )
 
-    # LIST output (first item is the runtime)
     res = [("__time__", fmt_time(total))]
-    res.extend([(str(doc_id), doc_title(doc_id)) for doc_id, _ in ranked[:100]])
+    res.extend([(str(doc_id), doc_title(doc_id)) for doc_id, _ in top])
     return jsonify(res)
 
 @app.route("/search_body")
@@ -263,14 +318,17 @@ def search_body():
         return jsonify([])
 
     tokens = tokenize(query)
-    scores = tfidf_body_scores(tokens)
-    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+
+    # Use same capped candidates for fairness + speed
+    candidates = build_candidates(tokens, MAX_CANDIDATES)
+    scores = tfidf_body_scores(tokens, candidates=candidates)
+    ranked = heapq.nlargest(MAX_RESULTS, scores.items(), key=lambda x: x[1])
 
     total = time.time() - t_start
-    print(f"[SEARCH_BODY TIMING] query='{query}' | total={total:.3f}s")
+    print(f"[SEARCH_BODY TIMING] query='{query}' | total={total:.3f}s | cands={len(candidates)}")
 
     res = [("__time__", fmt_time(total))]
-    res.extend([(str(doc_id), doc_title(doc_id)) for doc_id, _ in ranked[:100]])
+    res.extend([(str(doc_id), doc_title(doc_id)) for doc_id, _ in ranked])
     return jsonify(res)
 
 @app.route("/search_title")
@@ -281,11 +339,14 @@ def search_title():
         return jsonify([])
 
     tokens = tokenize(query)
-    scores = binary_match_count(title_index, tokens)
-    ranked = sorted(scores.items(), key=lambda x: (-x[1], x[0]))
+
+    candidates = build_candidates(tokens, MAX_CANDIDATES)
+    scores = binary_match_count(title_index, tokens, candidates=candidates)
+
+    ranked = heapq.nlargest(MAX_RESULTS, scores.items(), key=lambda x: (x[1], -int(x[0]) if str(x[0]).isdigit() else 0))
 
     total = time.time() - t_start
-    print(f"[SEARCH_TITLE TIMING] query='{query}' | total={total:.3f}s")
+    print(f"[SEARCH_TITLE TIMING] query='{query}' | total={total:.3f}s | cands={len(candidates)}")
 
     res = [("__time__", fmt_time(total))]
     res.extend([(str(doc_id), doc_title(doc_id)) for doc_id, _ in ranked])
@@ -299,11 +360,14 @@ def search_anchor():
         return jsonify([])
 
     tokens = tokenize(query)
-    scores = binary_match_count(anchor_index, tokens)
-    ranked = sorted(scores.items(), key=lambda x: (-x[1], x[0]))
+
+    candidates = build_candidates(tokens, MAX_CANDIDATES)
+    scores = binary_match_count(anchor_index, tokens, candidates=candidates)
+
+    ranked = heapq.nlargest(MAX_RESULTS, scores.items(), key=lambda x: (x[1], -int(x[0]) if str(x[0]).isdigit() else 0))
 
     total = time.time() - t_start
-    print(f"[SEARCH_ANCHOR TIMING] query='{query}' | total={total:.3f}s")
+    print(f"[SEARCH_ANCHOR TIMING] query='{query}' | total={total:.3f}s | cands={len(candidates)}")
 
     res = [("__time__", fmt_time(total))]
     res.extend([(str(doc_id), doc_title(doc_id)) for doc_id, _ in ranked])
